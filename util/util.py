@@ -8,6 +8,40 @@ import os
 import collections
 from PIL import Image
 import cv2
+from collections import OrderedDict
+
+def save_all_tensors(opt, real_A, fake_B, fake_B_first, fake_B_raw, real_B, flow_ref, conf_ref, flow, weight, modelD):
+    if opt.label_nc != 0:
+        input_image = tensor2label(real_A, opt.label_nc)
+    elif opt.dataset_mode == 'pose':
+        input_image = tensor2im(real_A)
+        if real_A.size()[2] == 6:
+            input_image2 = tensor2im(real_A[0, -1, 3:])
+            input_image[input_image2 != 0] = input_image2[input_image2 != 0]
+    else:
+        c = 3 if opt.input_nc >= 3 else 1
+        input_image = tensor2im(real_A[0, -1, :c], normalize=False)
+    if opt.use_instance:
+        edges = tensor2im(real_A[0, -1, -1:], normalize=False)
+        input_image += edges[:,:,np.newaxis]
+    
+    if opt.add_face_disc:
+        ys, ye, xs, xe = modelD.module.get_face_region(real_A[0, -1:])
+        if ys is not None:
+            input_image[ys, xs:xe, :] = input_image[ye, xs:xe, :] = input_image[ys:ye, xs, :] = input_image[ys:ye, xe, :] = 255 
+
+    visual_list = [('input_image', input_image),
+                   ('fake_image', tensor2im(fake_B)),
+                   ('fake_first_image', tensor2im(fake_B_first)),
+                   ('fake_raw_image', tensor2im(fake_B_raw)),
+                   ('real_image', tensor2im(real_B)),                                                          
+                   ('flow_ref', tensor2flow(flow_ref)),
+                   ('conf_ref', tensor2im(conf_ref, normalize=False))]
+    if flow is not None:
+        visual_list += [('flow', tensor2flow(flow)),
+                        ('weight', tensor2im(weight, normalize=False))]
+    visuals = OrderedDict(visual_list)
+    return visuals
 
 # Converts a Tensor into a Numpy array
 # |imtype|: the desired type of the converted numpy array
@@ -20,8 +54,11 @@ def tensor2im(image_tensor, imtype=np.uint8, normalize=True):
 
     if isinstance(image_tensor, torch.autograd.Variable):
         image_tensor = image_tensor.data
+    if len(image_tensor.size()) == 5:
+        image_tensor = image_tensor[0, -1]
     if len(image_tensor.size()) == 4:
         image_tensor = image_tensor[0]
+    image_tensor = image_tensor[:3]
     image_numpy = image_tensor.cpu().float().numpy()
     if normalize:
         image_numpy = (np.transpose(image_numpy, (1, 2, 0)) + 1) / 2.0 * 255.0
@@ -36,6 +73,8 @@ def tensor2im(image_tensor, imtype=np.uint8, normalize=True):
 def tensor2label(output, n_label, imtype=np.uint8):
     if isinstance(output, torch.autograd.Variable):
         output = output.data
+    if len(output.size()) == 5:
+        output = output[0, -1]
     if len(output.size()) == 4:
         output = output[0]
     output = output.cpu().float()    
@@ -50,6 +89,8 @@ def tensor2label(output, n_label, imtype=np.uint8):
 def tensor2flow(output, imtype=np.uint8):
     if isinstance(output, torch.autograd.Variable):
         output = output.data
+    if len(output.size()) == 5:
+        output = output[0, -1]
     if len(output.size()) == 4:
         output = output[0]
     output = output.cpu().float().numpy()
@@ -65,62 +106,28 @@ def tensor2flow(output, imtype=np.uint8):
     rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
     return rgb
 
-def make_anaglyph(imL, imR):
-    lRed, lGreen, lBlue = imL[:,:,0], imL[:,:,1], imL[:,:,2]
-    rRed, rGreen, rBlue = imR[:,:,0], imR[:,:,1], imR[:,:,2]
-    return np.dstack((rRed, lGreen, lBlue))
+def add_dummy_to_tensor(tensors, add_size=0):
+    if add_size == 0 or tensors is None: return tensors
+    if isinstance(tensors, list):
+        return [add_dummy_to_tensor(tensor, add_size) for tensor in tensors]    
+    
+    if isinstance(tensors, torch.Tensor):
+        dummy = torch.zeros_like(tensors)[:add_size]
+        tensors = torch.cat([dummy, tensors])
+    return tensors
 
-def ycbcr2rgb(img_y, img_cb, img_cr):
-    im = np.dstack((img_y, img_cb, img_cr))
-    xform = np.array([[1, 0, 1.402], [1, -0.34414, -.71414], [1, 1.772, 0]])
-    rgb = im.astype(np.float)
-    rgb[:,:,[1,2]] -= 128
-    return np.uint8(np.clip(rgb.dot(xform.T), 0, 255))
-
-def rgb2yuv(R, G, B):    
-    Y =  0.299*R + 0.587*G + 0.114*B
-    U = -0.147*R - 0.289*G + 0.436*B
-    V =  0.615*R - 0.515*G - 0.100*B
-    return Y, U, V
-
-def yuv2rgb(Y, U, V):    
-    R = (Y + 1.14 * V)
-    G = (Y - 0.39 * U - 0.58 * V)
-    B = (Y + 2.03 * U)
-    return R, G, B
-
-def diagnose_network(net, name='network'):
-    mean = 0.0
-    count = 0
-    for param in net.parameters():
-        if param.grad is not None:
-            mean += torch.mean(torch.abs(param.grad.data))
-            count += 1
-    if count > 0:
-        mean = mean / count
-    print(name)
-    print(mean)
-
+def remove_dummy_from_tensor(tensors, remove_size=0):
+    if remove_size == 0 or tensors is None: return tensors
+    if isinstance(tensors, list):
+        return [remove_dummy_from_tensor(tensor, remove_size) for tensor in tensors]    
+    
+    if isinstance(tensors, torch.Tensor):
+        tensors = tensors[remove_size:]
+    return tensors
 
 def save_image(image_numpy, image_path):
     image_pil = Image.fromarray(image_numpy)
     image_pil.save(image_path)
-
-def info(object, spacing=10, collapse=1):
-    """Print methods and doc strings.
-    Takes module, class, list, dictionary, or string."""
-    methodList = [e for e in dir(object) if isinstance(getattr(object, e), collections.Callable)]
-    processFunc = collapse and (lambda s: " ".join(s.split())) or (lambda s: s)
-    print( "\n".join(["%s %s" %
-                     (method.ljust(spacing),
-                      processFunc(str(getattr(object, method).__doc__)))
-                     for method in methodList]) )
-
-def varname(p):
-    for line in inspect.getframeinfo(inspect.currentframe().f_back)[3]:
-        m = re.search(r'\bvarname\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)', line)
-        if m:
-            return m.group(1)
 
 def print_numpy(x, val=True, shp=False):
     x = x.astype(np.float64)
@@ -131,14 +138,12 @@ def print_numpy(x, val=True, shp=False):
         print('mean = %3.3f, min = %3.3f, max = %3.3f, median = %3.3f, std=%3.3f' % (
             np.mean(x), np.min(x), np.max(x), np.median(x), np.std(x)))
 
-
 def mkdirs(paths):
     if isinstance(paths, list) and not isinstance(paths, str):
         for path in paths:
             mkdir(path)
     else:
         mkdir(paths)
-
 
 def mkdir(path):
     if not os.path.exists(path):
@@ -149,43 +154,22 @@ def uint82bin(n, count=8):
     return ''.join([str((n >> y) & 1) for y in range(count-1, -1, -1)])
 
 def labelcolormap(N):
-    if N == 35: # GTA/cityscape train
+    if N == 35: # Cityscapes train
         cmap = np.array([(  0,  0,  0), (  0,  0,  0), (  0,  0,  0), (  0,  0,  0), (  0,  0,  0), (111, 74,  0), ( 81,  0, 81),
                      (128, 64,128), (244, 35,232), (250,170,160), (230,150,140), ( 70, 70, 70), (102,102,156), (190,153,153),
                      (180,165,180), (150,100,100), (150,120, 90), (153,153,153), (153,153,153), (250,170, 30), (220,220,  0),
                      (107,142, 35), (152,251,152), ( 70,130,180), (220, 20, 60), (255,  0,  0), (  0,  0,142), (  0,  0, 70),
                      (  0, 60,100), (  0,  0, 90), (  0,  0,110), (  0, 80,100), (  0,  0,230), (119, 11, 32), (  0,  0,142)], 
                      dtype=np.uint8)
-    elif N == 20: # GTA/cityscape eval
+    elif N == 20: # Cityscapes eval
         cmap = np.array([(128, 64,128), (244, 35,232), ( 70, 70, 70), (102,102,156), (190,153,153), (153,153,153), (250,170, 30), 
                          (220,220,  0), (107,142, 35), (152,251,152), ( 70,130,180), (220, 20, 60), (255,  0,  0), (  0,  0,142), 
                          (  0,  0, 70), (  0, 60,100), (  0, 80,100), (  0,  0,230), (119, 11, 32), (  0,  0,  0)], 
                          dtype=np.uint8)
-    elif N == 23: # Synthia
-        cmap = np.array([(0,  0,  0  ), (70, 130,180), (70, 70, 70 ), (128,64, 128), (244,35, 232), (64, 64, 128), (107,142,35 ),
-                     (153,153,153), (0,  0,  142), (220,220,0  ), (220,20, 60 ), (119,11, 32 ), (0,  0,  230), (250,170,160),
-                     (128,64, 64 ), (250,170,30 ), (152,251,152), (255,0,  0  ), (0,  0,  70 ), (0,  60, 100), (0,  80, 100), 
-                     (102,102,156), (102,102,156)],
-                     dtype=np.uint8)
-    elif N == 32: # new GTA train
-        cmap = np.array([(0,   0,   0), (111,  74,   0), (70,  130, 180), (128, 64,  128), (244, 35,  232), (230,  150, 140), (152, 251, 152), 
-                         (87, 182, 35), (35,  142,  35), (70,  70,  70), (153, 153, 153), (190, 153, 153), (150, 20,  20), (250, 170, 30), 
-                         (220, 220, 0), (180, 180, 100), (173, 153, 153), (168, 153, 153), (81,  0,   21),  (81,  0,   81), (220, 20,  60), 
-                         (255,  0,  0), (119,  11,  32), (0,   0,   230), (0,   0,   142), (0,   80,  100), (0,   60,  100), (0,   0 ,  70),  
-                         (0,    0, 90), (0,   80,  100), (0,   100, 100), (50,  0,   90)],
-                         dtype=np.uint8)
-    elif N == 24: # new GTA eval
-        cmap = np.array([(70,  130, 180), (128, 64,  128), (244, 35,  232), (152, 251, 152), (87,  182, 35), (35,  142, 35), (70,  70,  70),
-                         (153, 153, 153), (190, 153, 153), (150, 20,  20), (250, 170, 30), (220, 220, 0), (180, 180, 100), (173, 153, 153),
-                         (168, 153, 153), (81,  0,   21),  (81,  0,   81), (220, 20,  60), (0,   0,   230), (0,   0,   142), (0,   80,  100),
-                         (0,   60,  100), (0,   0 ,  70),  (0,   0,   0)],
-                         dtype=np.uint8)
-    elif N == 154 or N == 11 or N == 151 or N == 233:
+    else:
         cmap = np.zeros((N, 3), dtype=np.uint8)
         for i in range(N):
-            r = 0
-            g = 0
-            b = 0
+            r, g, b = 0, 0, 0            
             id = i
             for j in range(7):
                 str_id = uint82bin(id)
@@ -193,16 +177,11 @@ def labelcolormap(N):
                 g = g ^ (np.uint8(str_id[-2]) << (7-j))
                 b = b ^ (np.uint8(str_id[-3]) << (7-j))
                 id = id >> 3
-            cmap[i, 0] = r
-            cmap[i, 1] = g
-            cmap[i, 2] = b
-    else:
-        raise NotImplementedError('Colorization for label number [%s] is not recognized' % N)
+            cmap[i, 0], cmap[i, 1], cmap[i, 2] = r, g, b             
     return cmap
 
 def colormap(n):
     cmap = np.zeros([n, 3]).astype(np.uint8)
-
     for i in np.arange(n):
         r, g, b = np.zeros(3)
 
